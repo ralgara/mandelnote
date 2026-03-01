@@ -114,6 +114,12 @@ s.waitForBoot {
         "[set]  %.% -> %".format(name, param, val).postln;
     }, '/music/set');
 
+    // /sc/eval  codeString  — evaluate arbitrary SC code (used to create new synths)
+    OSCdef(\eval, { |msg|
+        msg[1].asString.interpret;
+        "[eval] code received".postln;
+    }, '/sc/eval');
+
     "── music engine ready — start chat.py ──".postln;
 };
 )

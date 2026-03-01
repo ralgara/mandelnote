@@ -72,6 +72,44 @@ pulse — soft rhythmic element; pitched click + pink noise layer
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
+SYNTH_CONVENTIONS = """
+CREATING NEW INSTRUMENTS
+------------------------
+You can synthesize anything that isn't already available by creating a new SuperCollider
+SynthDef on the fly. Use a <synth> block — the code is sent to SC and evaluated immediately.
+
+Strict conventions (required for routing to work):
+- Use SINGLE-QUOTED symbols throughout: 'name' not \\name (avoids JSON escaping issues)
+- Every SynthDef must include args: out=0, rev=0, gate=0, ..., sendAmt=X
+- Use Linen.kr(gate, attackTime, 1, releaseTime, 0) to control amplitude envelope
+- Write to BOTH outputs: Out.ar(out, sig) and Out.ar(rev, sig * sendAmt)
+- Wrap in a Routine so the SynthDef registers on the server before instantiation
+
+Format:
+
+<synth>
+name: your_name
+params: {"gate": 0, "amp": 0.4, "param1": 1.0, "sendAmt": 0.8}
+---
+Routine {
+    SynthDef('your_name', {
+        |out=0, rev=0, gate=0, amp=0.4, param1=1.0, sendAmt=0.8|
+        var env = Linen.kr(gate, 2, 1, 3, 0);
+        var sig = ...; // synthesis here — make it stereo (2-channel array)
+        sig = sig * amp * env;
+        Out.ar(out, sig);
+        Out.ar(rev, sig * sendAmt);
+    }).add;
+    s.sync;
+    ~synths['your_name'] = Synth('your_name', ['rev', ~rev]);
+    "your_name ready".postln;
+}.play;
+</synth>
+
+After creating a synth, use a <music> block to activate it (gate: 1).
+Errors appear in the SC post window — if a synth doesn't respond, check there.
+""".strip()
+
 SYSTEM = f"""You are a musical co-creator in a live generative music session. \
 The music is playing right now in SuperCollider. You and the user are shaping it together — \
 either of you can drive changes or simply talk about what's happening.
@@ -92,9 +130,12 @@ Rules for the music block:
 - gate 1 activates an instrument with a smooth fade-in; gate 0 silences it with a fade-out.
 - Changes apply immediately and silently — you don't need to narrate the JSON.
 
+{SYNTH_CONVENTIONS}
+
 How to engage:
 - Respond naturally to what the user says, and change the music when it fits.
 - You can initiate changes yourself ("I want to try something darker here...") and apply them.
+- You can create new instruments whenever the existing palette isn't enough.
 - You can appreciate what's working, suggest ideas without applying them, or ask questions.
 - Think musically: dynamics, space, contrast, texture, tension, release.
 - Keep responses concise — you're a collaborator in an ongoing session, not an explainer.
@@ -142,6 +183,39 @@ def extract_music(text: str) -> tuple[dict | None, str]:
     except json.JSONDecodeError:
         return None, text
 
+
+def extract_synth(text: str) -> tuple[dict | None, str]:
+    match = re.search(r"<synth>\s*(.*?)\s*</synth>", text, re.DOTALL)
+    if not match:
+        return None, text
+    content = match.group(1)
+    parts = content.split("---", 1)
+    if len(parts) != 2:
+        return None, text
+    meta_lines, code = parts
+    meta: dict = {}
+    for line in meta_lines.strip().splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            meta[k.strip()] = v.strip()
+    name = meta.get("name", "").strip()
+    try:
+        params = json.loads(meta.get("params", "{}"))
+    except json.JSONDecodeError:
+        params = {}
+    if not name:
+        return None, text
+    clean = re.sub(r"\s*<synth>.*?</synth>\s*", "\n", text, flags=re.DOTALL).strip()
+    return {"name": name, "params": params, "code": code.strip()}, clean
+
+
+def apply_synth(synth: dict) -> None:
+    name = synth["name"]
+    osc.send_message("/sc/eval", [synth["code"]])
+    # Register in state so future turns include it and <music> blocks can target it.
+    state[name] = {"gate": 0, **synth["params"]}
+    print(f"[synth] created '{name}' — check SC post window for errors")
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -169,19 +243,29 @@ def main() -> None:
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=500,
+            max_tokens=1200,
             system=SYSTEM,
             messages=messages,
         )
 
         reply = response.content[0].text
-        update, clean_reply = extract_music(reply)
 
+        # Handle synth creation first so <music> blocks can immediately target it.
+        synth, reply = extract_synth(reply)
+        if synth:
+            try:
+                apply_synth(synth)
+            except Exception as e:
+                print(f"[synth error] {e}")
+
+        update, reply = extract_music(reply)
         if update:
             try:
                 apply_update(update)
             except Exception as e:
                 print(f"[osc error] {e}")
+
+        clean_reply = reply
 
         print(f"\nclaude: {clean_reply}\n")
 
