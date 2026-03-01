@@ -95,6 +95,16 @@ s.waitForBoot {
     ~synths[\pulse]     = Synth(\pulse,     [\rev, ~rev]);
     Synth(\reverb, [\in, ~rev]); // last
 
+    // ── Harmonic state ────────────────────────────────────────────────────────
+
+    // Default: C major triad — overwritten by first /music/harmony message.
+    ~harm = (label: "C", root: 60, tones: [60, 64, 67], scale: [60, 62, 64, 65, 67, 69, 71]);
+    ~prog  = [];
+    ~beats_per_chord = 8;
+    ~swing = 0.0;
+    ~tempo_clock = TempoClock.new(1.5); // 90 BPM default
+    ~prog_routine = nil;
+
     // ── OSC Handlers ──────────────────────────────────────────────────────────
 
     // /music/gate  instrumentName  value(0|1)
@@ -119,6 +129,36 @@ s.waitForBoot {
         msg[1].asString.interpret;
         "[eval] code received".postln;
     }, '/sc/eval');
+
+    // /music/harmony  jsonString — set progression, BPM, restart clock
+    OSCdef(\harmony, { |msg|
+        var json = msg[1].asString.parseJSON;
+        var bpm  = json["bpm"].asFloat;
+        var bpc  = json["bars_per_chord"].asFloat;
+        var prog = json["progression"];
+        ~swing = (json["swing"] ?? { 0 }).asFloat;
+        ~tempo_clock.tempo = bpm / 60;
+        ~beats_per_chord = bpc * 4;
+        ~prog = prog.collect { |c|
+            (
+                label: c["label"].asString,
+                root:  c["root"].asInteger,
+                tones: c["tones"].asArray.collect(_.asInteger),
+                scale: c["scale"].asArray.collect(_.asInteger)
+            )
+        };
+        ~prog_routine !? { ~prog_routine.stop };
+        ~prog_routine = Routine {
+            var i = 0;
+            loop {
+                ~harm = ~prog[i % ~prog.size];
+                "[chord] %".format(~harm[\label]).postln;
+                i = i + 1;
+                ~beats_per_chord.wait;
+            }
+        }.play(~tempo_clock);
+        "[harmony] % BPM, % chords, % beats/chord".format(bpm, ~prog.size, ~beats_per_chord).postln;
+    }, '/music/harmony');
 
     "── music engine ready — start chat.py ──".postln;
 };

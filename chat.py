@@ -34,6 +34,9 @@ DEFAULT_STATE: dict[str, dict] = {
 
 state: dict[str, dict] = {k: dict(v) for k, v in DEFAULT_STATE.items()}
 
+# Harmonic state — mirrors what SC clock is playing through.
+harmony_state: dict = {"bpm": None, "swing": 0.0, "progression": []}
+
 # ── Instrument catalog (injected into system prompt) ─────────────────────────
 
 CATALOG = """
@@ -108,6 +111,44 @@ Routine {
 
 After creating a synth, use a <music> block to activate it (gate: 1).
 Errors appear in the SC post window — if a synth doesn't respond, check there.
+
+READING HARMONIC STATE IN SEQUENCERS
+When a harmony is active, read ~harm in your sequencer code:
+  ~harm[\\tones]  — Array of MIDI ints for current chord  (use .choose or index)
+  ~harm[\\scale]  — Array of MIDI ints for current scale  (for melody voices)
+  ~harm[\\root]   — Root MIDI note
+  ~harm[\\label]  — Chord name string (e.g. "C7")
+  ~swing          — Swing amount 0.0–0.5 (timing offset on off-beats)
+Convert MIDI to Hz: midiNote.midicps
+Example note choice: var note = ~harm[\\tones].choose.midicps;
+""".strip()
+
+HARMONY_DOCS = """
+SETTING HARMONY
+---------------
+Use a <harmony> block to establish key, tempo, and chord progression.
+SC receives it, starts a clock, and cycles through chords automatically.
+All sequencers reading ~harm[\\tones] / ~harm[\\scale] sync to it immediately.
+
+<harmony>
+{{
+  "bpm": 88,
+  "swing": 0.12,
+  "bars_per_chord": 2,
+  "progression": [
+    {{"label": "C7", "root": 48, "tones": [48,52,55,58], "scale": [48,50,52,53,55,57,58,60]}},
+    {{"label": "F7", "root": 53, "tones": [53,57,60,63], "scale": [53,55,57,58,60,62,63,65]}},
+    {{"label": "G7", "root": 55, "tones": [55,59,62,65], "scale": [55,57,59,60,62,64,65,67]}}
+  ]
+}}
+</harmony>
+
+Fields:
+- tones: MIDI notes of the chord (for bass and chord voices)
+- scale: available melody notes over this chord (chord tones + passing tones you choose)
+- bars_per_chord: how many 4/4 bars each chord lasts (use 2 or 4 to start)
+- swing: 0.0 = straight, 0.1–0.2 = light shuffle (read as ~swing in sequencers)
+You can reissue <harmony> at any time to change key, tempo, or progression mid-session.
 """.strip()
 
 SYSTEM = f"""You are a musical co-creator in a live generative music session. \
@@ -130,6 +171,8 @@ Rules for the music block:
 - gate 1 activates an instrument with a smooth fade-in; gate 0 silences it with a fade-out.
 - Changes apply immediately and silently — you don't need to narrate the JSON.
 
+{HARMONY_DOCS}
+
 {SYNTH_CONVENTIONS}
 
 How to engage:
@@ -145,7 +188,11 @@ The current musical state is prepended to each user message so you always know w
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def format_state() -> str:
-    lines = ["Current musical state:"]
+    lines = []
+    if harmony_state.get("bpm"):
+        prog = " → ".join(c["label"] for c in harmony_state["progression"])
+        lines.append(f"Harmony: {harmony_state['bpm']} BPM  swing={harmony_state['swing']}  [{prog}]")
+    lines.append("Instruments:")
     for name, params in state.items():
         status = "ON " if params.get("gate", 0) == 1 else "off"
         detail = "  ".join(
@@ -155,6 +202,27 @@ def format_state() -> str:
         )
         lines.append(f"  {name}: [{status}]  {detail}")
     return "\n".join(lines)
+
+
+def extract_harmony(text: str) -> tuple[dict | None, str]:
+    match = re.search(r"<harmony>\s*(.*?)\s*</harmony>", text, re.DOTALL)
+    if not match:
+        return None, text
+    try:
+        harmony = json.loads(match.group(1))
+        clean = re.sub(r"\s*<harmony>.*?</harmony>\s*", "\n", text, flags=re.DOTALL).strip()
+        return harmony, clean
+    except json.JSONDecodeError:
+        return None, text
+
+
+def apply_harmony(harmony: dict) -> None:
+    osc.send_message("/music/harmony", [json.dumps(harmony)])
+    harmony_state["bpm"] = harmony.get("bpm")
+    harmony_state["swing"] = harmony.get("swing", 0.0)
+    harmony_state["progression"] = harmony.get("progression", [])
+    n = len(harmony_state["progression"])
+    print(f"[harmony] {harmony.get('bpm')} BPM, {n} chords")
 
 
 def apply_update(update: dict) -> None:
@@ -243,14 +311,21 @@ def main() -> None:
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=1200,
+            max_tokens=1500,
             system=SYSTEM,
             messages=messages,
         )
 
         reply = response.content[0].text
 
-        # Handle synth creation first so <music> blocks can immediately target it.
+        # Process in order: harmony → synth → music.
+        harmony, reply = extract_harmony(reply)
+        if harmony:
+            try:
+                apply_harmony(harmony)
+            except Exception as e:
+                print(f"[harmony error] {e}")
+
         synth, reply = extract_synth(reply)
         if synth:
             try:
