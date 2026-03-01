@@ -56,8 +56,8 @@ s.waitForBoot {
         |out=0, rev=0, gate=0, amp=0.25, filterFreq=1200, filterRQ=0.4, attack=5.0, sendAmt=0.6|
         var env = Linen.kr(gate, attack, 1, 8, 0);
         var sig = Mix.fill(6, {|i|
-            var freq  = ExpRand.ir(150, 1200);
-            var drift = LFNoise1.kr(ExpRand.ir(0.02, 0.07)).range(0.99, 1.01);
+            var freq  = ExpRand(150, 1200);
+            var drift = LFNoise1.kr(ExpRand(0.02, 0.07)).range(0.99, 1.01);
             VarSaw.ar(freq * drift, 0, LFNoise1.kr(0.1).range(0.2, 0.8))
         });
         sig = RLPF.ar(sig * 0.15, filterFreq, filterRQ);
