@@ -2,42 +2,170 @@
 """
 Generative music chat — natural language drives SuperCollider in real time.
 
-Requirements:
-    pip install anthropic python-osc
-
 Usage:
-    1. Open music.scd in SuperCollider IDE, select all, evaluate.
-    2. Wait for "music engine ready" in SC post window.
-    3. python3 chat.py
+    uv run python chat.py
 
-Both you and Claude can shape the music. Press Enter alone to let Claude initiate.
+Prerequisites:
+    1. Open music.scd in SuperCollider IDE, select all (Cmd+A), evaluate (Cmd+Return).
+    2. Wait for "music engine ready" in SC post window.
+    3. Run this script.
 """
 
 import json
 import re
-import sys
+import shutil
+import textwrap
+from datetime import datetime
+from pathlib import Path
+
 from anthropic import Anthropic
 from pythonosc import udp_client
 
-# ── OSC client ───────────────────────────────────────────────────────────────
+# ── ANSI colors ───────────────────────────────────────────────────────────────
+
+class C:
+    R       = '\033[0m'
+    BOLD    = '\033[1m'
+    DIM     = '\033[2m'
+    USER    = '\033[96m'    # bright cyan
+    CLAUDE  = '\033[97m'    # bright white
+    HARMONY = '\033[93m'    # bright yellow
+    SYNTH   = '\033[35m'    # magenta
+    CODE    = '\033[33m'    # amber — SC code
+    ON      = '\033[92m'    # bright green
+    OFF     = '\033[90m'    # dark gray
+    PARAM   = '\033[94m'    # bright blue
+    SEP     = '\033[90m'    # dark gray
+    HINT    = '\033[90m'    # dim hints / paths
+    ERR     = '\033[91m'    # bright red
+
+# ── Terminal layout ───────────────────────────────────────────────────────────
+
+W = shutil.get_terminal_size((100, 24)).columns
+
+def _sep(char: str = '─', color: str = C.SEP) -> None:
+    print(f"{color}{char * W}{C.R}")
+
+def _print_user(text: str) -> None:
+    print()
+    _sep()
+    if text:
+        print(f" {C.USER}{C.BOLD}◉  you{C.R}  {text}")
+    else:
+        print(f" {C.USER}{C.BOLD}◉  you{C.R}  {C.DIM}(no input — Claude initiates){C.R}")
+    print()
+
+def _print_claude(text: str) -> None:
+    print()
+    _sep()
+    print(f" {C.CLAUDE}{C.BOLD}◈  claude{C.R}")
+    _sep()
+    for para in text.split('\n'):
+        if para.strip():
+            wrapped = textwrap.fill(para, width=W - 2,
+                                    initial_indent=' ', subsequent_indent=' ')
+            print(f"{C.CLAUDE}{wrapped}{C.R}")
+        else:
+            print()
+    print()
+
+def _print_harmony(harmony: dict) -> None:
+    prog  = ' → '.join(c['label'] for c in harmony.get('progression', []))
+    bpm   = harmony.get('bpm', '?')
+    swing = harmony.get('swing', 0)
+    print(f"\n  {C.HARMONY}♩  harmony   {C.R}"
+          f"{bpm} BPM · swing {swing}  "
+          f"{C.HARMONY}[ {prog} ]{C.R}")
+
+def _print_synth_block(synth: dict, saved_path: "Path | None") -> None:
+    name  = synth['name']
+    title = f" SC synth: {name} "
+    bar_w = max(2, W - len(title) - 5)
+    print()
+    print(f"  {C.SYNTH}┌─{title}{'─' * bar_w}┐{C.R}")
+    for raw_line in synth['code'].splitlines():
+        max_inner = W - 7
+        display = raw_line[:max_inner - 1] + '…' if len(raw_line) > max_inner else raw_line
+        print(f"  {C.SYNTH}│{C.R}  {C.CODE}{display}{C.R}")
+    print(f"  {C.SYNTH}└{'─' * (W - 4)}┘{C.R}")
+    if saved_path:
+        print(f"  {C.HINT}  ↳ saved {saved_path}{C.R}")
+    print()
+
+def _print_update(update: dict) -> None:
+    for name, params in update.items():
+        gate  = params.get('gate')
+        other = {k: v for k, v in params.items() if k != 'gate'}
+        parts = []
+        if gate is not None:
+            if int(gate) == 1:
+                parts.append(f"{C.ON}ON{C.R}")
+            else:
+                parts.append(f"{C.OFF}OFF{C.R}")
+        for k, v in other.items():
+            v_str = str(round(v, 3)) if isinstance(v, float) else str(v)
+            parts.append(f"{C.PARAM}{k}{C.R}={v_str}")
+        print(f"  {C.DIM}◆{C.R}  {name:<16}{'  '.join(parts)}")
+
+# ── Session logger ─────────────────────────────────────────────────────────────
+
+class Logger:
+    def __init__(self) -> None:
+        Path("logs").mkdir(exist_ok=True)
+        Path("synths").mkdir(exist_ok=True)
+        ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = Path(f"logs/session_{ts}.log")
+        self._f   = open(self.path, 'w', buffering=1)  # line-buffered
+        self._write("session", f"started — {self.path}")
+
+    def _write(self, kind: str, detail: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._f.write(f"[{ts}] {kind:<14} {detail}\n")
+
+    def msg(self, role: str, text: str) -> None:
+        self._write(role, text.replace('\n', ' ')[:300])
+
+    def harmony(self, h: dict) -> None:
+        prog = ' → '.join(c['label'] for c in h.get('progression', []))
+        self._write("harmony", f"{h.get('bpm')} BPM  swing={h.get('swing', 0)}  [{prog}]")
+
+    def gate(self, name: str, val: float) -> None:
+        self._write("gate", f"{name} → {'ON' if int(val) == 1 else 'OFF'}")
+
+    def set_(self, name: str, param: str, val: float) -> None:
+        self._write("set", f"{name}.{param} = {round(val, 4)}")
+
+    def synth(self, name: str, path: "Path | None") -> None:
+        saved = f"  saved → {path}" if path else ""
+        self._write("synth", f"created '{name}'{saved}")
+
+    def save_synth(self, name: str, code: str) -> Path:
+        ts   = datetime.now().strftime("%H%M%S")
+        path = Path(f"synths/{name}_{ts}.scd")
+        path.write_text(code)
+        return path
+
+    def close(self) -> None:
+        self._write("session", "ended")
+        self._f.close()
+
+# ── OSC client ────────────────────────────────────────────────────────────────
 
 osc = udp_client.SimpleUDPClient("127.0.0.1", 57120)
 
 # ── Musical state ─────────────────────────────────────────────────────────────
 
 DEFAULT_STATE: dict[str, dict] = {
-    "sub_drone": {"gate": 0, "freq": 45.0,   "amp": 0.55, "detune": 0.4,  "lfoRate": 0.08, "sendAmt": 0.5 },
-    "bells":     {"gate": 0, "density": 0.2,  "brightness": 0.7, "amp": 0.4,  "sendAmt": 0.85},
+    "sub_drone": {"gate": 0, "freq": 45.0,  "amp": 0.55, "detune": 0.4,  "lfoRate": 0.08, "sendAmt": 0.5 },
+    "bells":     {"gate": 0, "density": 0.2, "brightness": 0.7, "amp": 0.4,  "sendAmt": 0.85},
     "pad":       {"gate": 0, "amp": 0.25, "filterFreq": 1200.0, "filterRQ": 0.4, "attack": 5.0, "sendAmt": 0.6 },
-    "pulse":     {"gate": 0, "rate": 2.0,     "amp": 0.25, "filterFreq": 400.0, "sendAmt": 0.3 },
+    "pulse":     {"gate": 0, "rate": 2.0,  "amp": 0.25, "filterFreq": 400.0, "sendAmt": 0.3 },
 }
 
 state: dict[str, dict] = {k: dict(v) for k, v in DEFAULT_STATE.items()}
-
-# Harmonic state — mirrors what SC clock is playing through.
 harmony_state: dict = {"bpm": None, "swing": 0.0, "progression": []}
 
-# ── Instrument catalog (injected into system prompt) ─────────────────────────
+# ── Instrument catalog ────────────────────────────────────────────────────────
 
 CATALOG = """
 INSTRUMENTS
@@ -73,7 +201,7 @@ pulse — soft rhythmic element; pitched click + pink noise layer
   sendAmt: 0.0–1.0
 """.strip()
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── Prompt sections ───────────────────────────────────────────────────────────
 
 SYNTH_CONVENTIONS = """
 CREATING NEW INSTRUMENTS
@@ -87,6 +215,9 @@ Strict conventions (required for routing to work):
 - Use Linen.kr(gate, attackTime, 1, releaseTime, 0) to control amplitude envelope
 - Write to BOTH outputs: Out.ar(out, sig) and Out.ar(rev, sig * sendAmt)
 - Wrap in a Routine so the SynthDef registers on the server before instantiation
+- CRITICAL: ALL var declarations must appear at the TOP of the SynthDef function body,
+  before any other statements. SuperCollider forbids var declarations after expressions.
+  Declare every variable you will use upfront, then assign them below.
 
 Format:
 
@@ -97,9 +228,10 @@ params: {"gate": 0, "amp": 0.4, "param1": 1.0, "sendAmt": 0.8}
 Routine {
     SynthDef('your_name', {
         |out=0, rev=0, gate=0, amp=0.4, param1=1.0, sendAmt=0.8|
-        var env = Linen.kr(gate, 2, 1, 3, 0);
-        var sig = ...; // synthesis here — make it stereo (2-channel array)
-        sig = sig * amp * env;
+        var env, sig, other;  // declare ALL vars first — no var after any statement
+        env = Linen.kr(gate, 2, 1, 3, 0);
+        other = ...; // intermediate signals
+        sig = Pan2.ar(other * amp * env, 0); // make it stereo
         Out.ar(out, sig);
         Out.ar(rev, sig * sendAmt);
     }).add;
@@ -204,7 +336,7 @@ def format_state() -> str:
     return "\n".join(lines)
 
 
-def extract_harmony(text: str) -> tuple[dict | None, str]:
+def extract_harmony(text: str) -> "tuple[dict | None, str]":
     match = re.search(r"<harmony>\s*(.*?)\s*</harmony>", text, re.DOTALL)
     if not match:
         return None, text
@@ -216,31 +348,7 @@ def extract_harmony(text: str) -> tuple[dict | None, str]:
         return None, text
 
 
-def apply_harmony(harmony: dict) -> None:
-    osc.send_message("/music/harmony", [json.dumps(harmony)])
-    harmony_state["bpm"] = harmony.get("bpm")
-    harmony_state["swing"] = harmony.get("swing", 0.0)
-    harmony_state["progression"] = harmony.get("progression", [])
-    n = len(harmony_state["progression"])
-    print(f"[harmony] {harmony.get('bpm')} BPM, {n} chords")
-
-
-def apply_update(update: dict) -> None:
-    for instrument, params in update.items():
-        if instrument not in state:
-            continue
-        # Apply gate first so the fade-in starts before other param changes land.
-        if "gate" in params:
-            osc.send_message("/music/gate", [instrument, float(params["gate"])])
-            state[instrument]["gate"] = int(params["gate"])
-        for param, value in params.items():
-            if param == "gate":
-                continue
-            osc.send_message("/music/set", [instrument, param, float(value)])
-            state[instrument][param] = value
-
-
-def extract_music(text: str) -> tuple[dict | None, str]:
+def extract_music(text: str) -> "tuple[dict | None, str]":
     match = re.search(r"<music>\s*(.*?)\s*</music>", text, re.DOTALL)
     if not match:
         return None, text
@@ -252,7 +360,7 @@ def extract_music(text: str) -> tuple[dict | None, str]:
         return None, text
 
 
-def extract_synth(text: str) -> tuple[dict | None, str]:
+def extract_synth(text: str) -> "tuple[dict | None, str]":
     match = re.search(r"<synth>\s*(.*?)\s*</synth>", text, re.DOTALL)
     if not match:
         return None, text
@@ -276,80 +384,117 @@ def extract_synth(text: str) -> tuple[dict | None, str]:
     clean = re.sub(r"\s*<synth>.*?</synth>\s*", "\n", text, flags=re.DOTALL).strip()
     return {"name": name, "params": params, "code": code.strip()}, clean
 
+# ── Apply actions ─────────────────────────────────────────────────────────────
 
-def apply_synth(synth: dict) -> None:
-    name = synth["name"]
+def apply_harmony(harmony: dict, log: Logger) -> None:
+    _print_harmony(harmony)
+    osc.send_message("/music/harmony", [json.dumps(harmony)])
+    log.harmony(harmony)
+    harmony_state["bpm"]         = harmony.get("bpm")
+    harmony_state["swing"]       = harmony.get("swing", 0.0)
+    harmony_state["progression"] = harmony.get("progression", [])
+
+
+def apply_synth(synth: dict, log: Logger) -> None:
+    saved = log.save_synth(synth["name"], synth["code"])
+    _print_synth_block(synth, saved)
     osc.send_message("/sc/eval", [synth["code"]])
-    # Register in state so future turns include it and <music> blocks can target it.
-    state[name] = {"gate": 0, **synth["params"]}
-    print(f"[synth] created '{name}' — check SC post window for errors")
+    log.synth(synth["name"], saved)
+    state[synth["name"]] = {"gate": 0, **synth["params"]}
+
+
+def apply_update(update: dict, log: Logger) -> None:
+    _print_update(update)
+    for instrument, params in update.items():
+        if instrument not in state:
+            continue
+        if "gate" in params:
+            val = float(params["gate"])
+            osc.send_message("/music/gate", [instrument, val])
+            log.gate(instrument, val)
+            state[instrument]["gate"] = int(val)
+        for param, value in params.items():
+            if param == "gate":
+                continue
+            osc.send_message("/music/set", [instrument, param, float(value)])
+            log.set_(instrument, param, float(value))
+            state[instrument][param] = value
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    log    = Logger()
     client = Anthropic()
     messages: list[dict] = []
 
-    print("Generative music session started.")
-    print("SuperCollider should be running music.scd.")
-    print("Type to talk. Press Enter alone for Claude to initiate. Ctrl+C to quit.\n")
+    _sep('═')
+    print(f" {C.BOLD}Mandelnote{C.R}  generative music session")
+    print(f" {C.HINT}SuperCollider should show 'music engine ready' in the post window")
+    print(f" {C.HINT}log → {log.path}{C.R}")
+    _sep('═')
+    print(f"\n {C.DIM}Type to talk. Press Enter alone to let Claude initiate. Ctrl+C to quit.{C.R}\n")
 
-    while True:
-        try:
-            user_input = input("you: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nSession ended.")
-            break
-
-        state_header = format_state()
-        if user_input:
-            content = f"{state_header}\n\n{user_input}"
-        else:
-            content = f"{state_header}\n\n[No input — feel free to initiate a change or reflect on the music.]"
-
-        messages.append({"role": "user", "content": content})
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            system=SYSTEM,
-            messages=messages,
-        )
-
-        reply = response.content[0].text
-
-        # Process in order: harmony → synth → music.
-        harmony, reply = extract_harmony(reply)
-        if harmony:
+    try:
+        while True:
             try:
-                apply_harmony(harmony)
-            except Exception as e:
-                print(f"[harmony error] {e}")
+                user_input = input(f" {C.USER}◉{C.R}  you  ›  ").strip()
+            except (KeyboardInterrupt, EOFError):
+                break
 
-        synth, reply = extract_synth(reply)
-        if synth:
-            try:
-                apply_synth(synth)
-            except Exception as e:
-                print(f"[synth error] {e}")
+            _print_user(user_input)
+            log.msg("user", user_input or "(no input)")
 
-        update, reply = extract_music(reply)
-        if update:
-            try:
-                apply_update(update)
-            except Exception as e:
-                print(f"[osc error] {e}")
+            state_header = format_state()
+            if user_input:
+                content = f"{state_header}\n\n{user_input}"
+            else:
+                content = f"{state_header}\n\n[No input — feel free to initiate a change or reflect on the music.]"
 
-        clean_reply = reply
+            messages.append({"role": "user", "content": content})
 
-        print(f"\nclaude: {clean_reply}\n")
+            print(f"  {C.DIM}⟳  thinking…{C.R}", end='', flush=True)
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1500,
+                system=SYSTEM,
+                messages=messages,
+            )
+            print(f"\r{' ' * 20}\r", end='', flush=True)
 
-        # Store clean reply (no music block) so history stays readable.
-        messages.append({"role": "assistant", "content": clean_reply})
+            reply = response.content[0].text
+            log.msg("claude", reply)
 
-        # Sliding window — keep last 30 messages to avoid unbounded growth.
-        if len(messages) > 30:
-            messages = messages[-30:]
+            # Process in order: harmony → synth → music
+            harmony, reply = extract_harmony(reply)
+            if harmony:
+                try:
+                    apply_harmony(harmony, log)
+                except Exception as e:
+                    print(f"  {C.ERR}⚠  harmony error: {e}{C.R}")
+
+            synth, reply = extract_synth(reply)
+            if synth:
+                try:
+                    apply_synth(synth, log)
+                except Exception as e:
+                    print(f"  {C.ERR}⚠  synth error: {e}{C.R}")
+
+            update, reply = extract_music(reply)
+            if update:
+                try:
+                    apply_update(update, log)
+                except Exception as e:
+                    print(f"  {C.ERR}⚠  osc error: {e}{C.R}")
+
+            _print_claude(reply)
+
+            messages.append({"role": "assistant", "content": reply})
+            if len(messages) > 30:
+                messages = messages[-30:]
+
+    finally:
+        print(f"\n{C.DIM}Session ended.{C.R}")
+        log.close()
 
 
 if __name__ == "__main__":
